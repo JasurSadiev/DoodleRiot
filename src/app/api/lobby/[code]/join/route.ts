@@ -1,17 +1,11 @@
-import {
-  advancePhase,
-  authenticate,
-  buildState,
-  findLobby,
-  joinLobby,
-  touchPlayer,
-} from "@/lib/server/engine";
+import { advancePhase, authenticate, buildState, joinLobby, touchPlayer } from "@/lib/server/engine";
 import { normalizeCode, sanitizeName } from "@/lib/game";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request, { params }: { params: Promise<{ code: string }> }) {
   const { code } = await params;
+  const clean = normalizeCode(code);
   let body: Record<string, unknown> = {};
   try {
     body = (await req.json()) as Record<string, unknown>;
@@ -19,29 +13,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ code: s
     body = {};
   }
 
-  const lobbyRow = await findLobby(normalizeCode(code));
-  if (!lobbyRow) {
+  const lobby = await advancePhase(clean);
+  if (!lobby) {
     return Response.json({ ok: false, error: "No lobby with that code." }, { status: 404 });
   }
-  const lobby = await advancePhase(lobbyRow);
 
   // Reconnect with an existing seat if the browser still remembers it.
   const existing = await authenticate(
-    lobby.id,
-    body.playerId ? Number(body.playerId) : null,
+    clean,
+    body.playerId ? String(body.playerId) : null,
     body.token ? String(body.token) : null,
   );
   if (existing) {
-    await touchPlayer(existing.id);
+    await touchPlayer(clean, existing.id);
     return Response.json({
       ok: true,
       session: {
-        code: lobby.code,
+        code: clean,
         playerId: existing.id,
         token: existing.token,
         name: existing.name,
       },
-      state: await buildState(lobby, existing),
+      state: await buildState(clean, existing),
     });
   }
 
@@ -53,11 +46,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ code: s
     );
   }
 
-  const player = await joinLobby(lobby, name, null);
-  const fresh = (await findLobby(lobby.code)) ?? lobby;
+  const player = await joinLobby(clean, name, null);
   return Response.json({
     ok: true,
-    session: { code: lobby.code, playerId: player.id, token: player.token, name: player.name },
-    state: await buildState(fresh, player),
+    session: { code: clean, playerId: player.id, token: player.token, name: player.name },
+    state: await buildState(clean, player),
   });
 }

@@ -13,7 +13,7 @@ export type Stroke = {
 };
 
 export type PlayerState = {
-  id: number;
+  id: string;
   name: string;
   isHost: boolean;
   score: number;
@@ -25,8 +25,8 @@ export type PlayerState = {
 };
 
 export type DrawingState = {
-  id: number;
-  playerId: number;
+  id: string;
+  playerId: string;
   authorName: string;
   authorColor: number;
   strokes: Stroke[];
@@ -53,22 +53,22 @@ export type LobbyState = {
   phaseEndsAt: number | null;
   serverNow: number;
   settings: LobbySettings;
-  you: { id: number; name: string; isHost: boolean; color: number } | null;
+  you: { id: string; name: string; isHost: boolean; color: number } | null;
   players: PlayerState[];
   drawings: DrawingState[];
-  myDrawingId: number | null;
-  myVoteId: number | null;
+  myDrawingId: string | null;
+  myVoteId: string | null;
   submittedCount: number;
   votedCount: number;
   winnerBonus: number;
-  totals: { playerId: number; name: string; score: number; color: number }[];
-  roundWinners: number[];
+  totals: { playerId: string; name: string; score: number; color: number }[];
+  roundWinners: string[];
   playerCount: number;
 };
 
 export type Session = {
   code: string;
-  playerId: number;
+  playerId: string;
   token: string;
   name: string;
 };

@@ -1,4 +1,4 @@
-import { createLobby, buildState } from "@/lib/server/engine";
+import { buildState, createLobby } from "@/lib/server/engine";
 import { sanitizeName } from "@/lib/game";
 
 export const dynamic = "force-dynamic";
@@ -20,7 +20,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const { lobby, player } = await createLobby({
+    const { code, player } = await createLobby({
       name,
       drawSeconds: Number(body.drawSeconds) || undefined,
       voteSeconds: Number(body.voteSeconds) || undefined,
@@ -29,11 +29,11 @@ export async function POST(req: Request) {
         ? (body.customPrompts as unknown[]).map((c) => String(c))
         : undefined,
     });
-    const state = await buildState(lobby, player);
+    const state = await buildState(code, player);
     return Response.json({
       ok: true,
       state,
-      session: { code: lobby.code, playerId: player.id, token: player.token, name: player.name },
+      session: { code, playerId: player.id, token: player.token, name: player.name },
     });
   } catch (err) {
     return Response.json(

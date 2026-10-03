@@ -1,16 +1,26 @@
-import { and, asc, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
 import {
-  drawings,
-  lobbies,
-  players,
-  votes,
-  type DrawingRow,
-  type LobbyRow,
-  type PlayerRow,
-  type VoteRow,
-} from "@/db/schema";
-import type { DrawingState, LobbyState, LobbyStatus, PlayerState, Stroke } from "@/lib/types";
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  increment,
+  query,
+  runTransaction,
+  setDoc,
+  updateDoc,
+  where,
+  writeBatch,
+} from "firebase/firestore";
+import { getFbs } from "@/lib/firebase";
+import type {
+  DrawingState,
+  LobbySettings,
+  LobbyState,
+  LobbyStatus,
+  PlayerState,
+  Stroke,
+} from "@/lib/types";
 import {
   clamp,
   makeCode,
@@ -23,159 +33,133 @@ import {
 } from "@/lib/game";
 import { packIds, PROMPT_PACKS } from "@/lib/prompts";
 
-async function reloadLobby(id: number): Promise<LobbyRow | null> {
-  const rows = await db.select().from(lobbies).where(eq(lobbies.id, id)).limit(1);
-  return rows[0] ?? null;
+/* ------------------------------------------------------------- data shapes */
+
+type LobbyDoc = {
+  code: string;
+  status: LobbyStatus;
+  round: number;
+  prompt: string | null;
+  phaseEndsAt: number | null;
+  drawSeconds: number;
+  voteSeconds: number;
+  promptPack: string;
+  customPrompts: string[];
+  usedPrompts: string[];
+  rev: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type PlayerDoc = {
+  id: string;
+  token: string;
+  name: string;
+  isHost: boolean;
+  score: number;
+  colorIdx: number;
+  lastSeenAt: number;
+  createdAt: number;
+};
+
+type DrawingDoc = {
+  id: string;
+  playerId: string;
+  round: number;
+  prompt: string;
+  strokes: Stroke[];
+  displayOrder: number;
+  submittedAt: number;
+};
+
+type VoteDoc = {
+  id: string;
+  drawingId: string;
+  voterId: string;
+  round: number;
+  createdAt: number;
+};
+
+/* ----------------------------------------------------------------- helpers */
+
+const now = () => Date.now();
+
+const lobbyRef = (code: string) => doc(getFbs(), "lobbies", code);
+const playersCol = (code: string) => collection(getFbs(), "lobbies", code, "players");
+const playerRef = (code: string, pid: string) => doc(getFbs(), "lobbies", code, "players", pid);
+const drawingsCol = (code: string) => collection(getFbs(), "lobbies", code, "drawings");
+const drawingRef = (code: string, did: string) => doc(getFbs(), "lobbies", code, "drawings", did);
+const votesCol = (code: string) => collection(getFbs(), "lobbies", code, "votes");
+const voteRef = (code: string, vid: string) => doc(getFbs(), "lobbies", code, "votes", vid);
+
+const roundDrawingsQuery = (code: string, round: number) =>
+  query(drawingsCol(code), where("round", "==", round));
+const roundVotesQuery = (code: string, round: number) => query(votesCol(code), where("round", "==", round));
+
+export async function getLobby(code: string): Promise<LobbyDoc | null> {
+  const snap = await getDoc(lobbyRef(code));
+  return (snap.data() as LobbyDoc) ?? null;
 }
 
-export async function findLobby(code: string): Promise<LobbyRow | null> {
-  const rows = await db
-    .select()
-    .from(lobbies)
-    .where(eq(lobbies.code, code.trim().toUpperCase()))
-    .limit(1);
-  return rows[0] ?? null;
+async function readPlayers(code: string): Promise<PlayerDoc[]> {
+  const snap = await getDocs(playersCol(code));
+  return snap.docs.map((d) => ({ ...(d.data() as Omit<PlayerDoc, "id">), id: d.id }))
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+async function readPlayer(code: string, pid: string): Promise<PlayerDoc | null> {
+  const snap = await getDoc(playerRef(code, pid));
+  if (!snap.exists()) return null;
+  return { ...(snap.data() as Omit<PlayerDoc, "id">), id: snap.id };
 }
 
 export async function authenticate(
-  lobbyId: number,
-  playerId?: number | null,
+  code: string,
+  playerId?: string | null,
   token?: string | null,
-): Promise<PlayerRow | null> {
+): Promise<PlayerDoc | null> {
   if (!playerId || !token) return null;
-  const rows = await db
-    .select()
-    .from(players)
-    .where(and(eq(players.id, playerId), eq(players.lobbyId, lobbyId), eq(players.token, token)))
-    .limit(1);
-  return rows[0] ?? null;
+  const p = await readPlayer(code, playerId);
+  return p && p.token === token ? p : null;
 }
 
-export async function touchPlayer(playerId: number | null | undefined): Promise<void> {
-  if (!playerId) return;
-  await db.update(players).set({ lastSeenAt: new Date() }).where(eq(players.id, playerId));
-}
-
-async function claim(
-  lobby: LobbyRow,
-  from: LobbyStatus,
-  patch: Partial<LobbyRow>,
-): Promise<LobbyRow | null> {
-  const rows = await db
-    .update(lobbies)
-    .set({ ...patch, rev: lobby.rev + 1, updatedAt: new Date() })
-    .where(and(eq(lobbies.id, lobby.id), eq(lobbies.status, from), eq(lobbies.rev, lobby.rev)))
-    .returning();
-  return rows[0] ?? null;
-}
-
-async function bump(lobbyId: number): Promise<void> {
-  await db
-    .update(lobbies)
-    .set({ rev: sql`${lobbies.rev} + 1`, updatedAt: new Date() })
-    .where(eq(lobbies.id, lobbyId));
-}
-
-function roundDrawings(lobbyId: number, round: number) {
-  return db
-    .select()
-    .from(drawings)
-    .where(and(eq(drawings.lobbyId, lobbyId), eq(drawings.round, round)))
-    .orderBy(asc(drawings.displayOrder), asc(drawings.id));
-}
-
-function roundVotes(lobbyId: number, round: number) {
-  return db
-    .select()
-    .from(votes)
-    .where(and(eq(votes.lobbyId, lobbyId), eq(votes.round, round)));
-}
-
-/** Drawing time is up: pencils down, ballots out. */
-async function beginVoting(lobby: LobbyRow): Promise<LobbyRow> {
-  const entries = await roundDrawings(lobby.id, lobby.round);
-  if (entries.length === 0) {
-    const claimed = await claim(lobby, "drawing", {
-      status: "lobby",
-      phaseEndsAt: null,
-      prompt: null,
-    });
-    return claimed ?? (await reloadLobby(lobby.id)) ?? lobby;
+export async function touchPlayer(code: string, playerId: string): Promise<void> {
+  try {
+    await updateDoc(playerRef(code, playerId), { lastSeenAt: now() });
+  } catch {
+    /* offline moment — presence just stays stale for a while */
   }
-
-  const order = shuffle(entries.map((d) => d.id));
-  for (let i = 0; i < order.length; i++) {
-    await db.update(drawings).set({ displayOrder: i }).where(eq(drawings.id, order[i]));
-  }
-
-  const claimed = await claim(lobby, "drawing", {
-    status: "voting",
-    phaseEndsAt: new Date(Date.now() + lobby.voteSeconds * 1000),
-  });
-  return claimed ?? (await reloadLobby(lobby.id)) ?? lobby;
 }
 
-/** Voting closed: tally up, award points. */
-async function beginResults(lobby: LobbyRow): Promise<LobbyRow> {
-  const entries = await roundDrawings(lobby.id, lobby.round);
-  const ballots = await roundVotes(lobby.id, lobby.round);
-
-  const claimed = await claim(lobby, "voting", { status: "results", phaseEndsAt: null });
-  if (!claimed) return (await reloadLobby(lobby.id)) ?? lobby;
-
-  const tally = new Map<number, number>();
-  for (const v of ballots) tally.set(v.drawingId, (tally.get(v.drawingId) ?? 0) + 1);
-
-  const top = Math.max(0, ...entries.map((d) => tally.get(d.id) ?? 0));
-  const winners = top > 0 ? entries.filter((d) => (tally.get(d.id) ?? 0) === top) : [];
-
-  const awarded = new Map<number, number>();
-  for (const d of entries) {
-    const points = (tally.get(d.id) ?? 0) + (winners.some((w) => w.id === d.id) ? WINNER_BONUS : 0);
-    if (points > 0) awarded.set(d.playerId, (awarded.get(d.playerId) ?? 0) + points);
-  }
-  for (const [playerId, points] of awarded) {
-    await db
-      .update(players)
-      .set({ score: sql`${players.score} + ${points}` })
-      .where(eq(players.id, playerId));
-  }
-
-  return (await reloadLobby(lobby.id)) ?? claimed;
+async function readRoundDrawings(code: string, round: number): Promise<DrawingDoc[]> {
+  const snap = await getDocs(roundDrawingsQuery(code, round));
+  return snap.docs.map((d) => ({ ...(d.data() as Omit<DrawingDoc, "id">), id: d.id }));
 }
 
-/** Runs on every poll/action so timers never need a background worker. */
-export async function advancePhase(lobby: LobbyRow): Promise<LobbyRow> {
-  let current = lobby;
-  for (let i = 0; i < 4; i++) {
-    if (!current.phaseEndsAt) return current;
-    if (current.phaseEndsAt.getTime() > Date.now()) return current;
-    if (current.status === "drawing") current = await beginVoting(current);
-    else if (current.status === "voting") current = await beginResults(current);
-    else return current;
-  }
-  return current;
+async function readRoundVotes(code: string, round: number): Promise<VoteDoc[]> {
+  const snap = await getDocs(roundVotesQuery(code, round));
+  return snap.docs.map((d) => ({ ...(d.data() as Omit<VoteDoc, "id">), id: d.id }));
 }
 
-async function beginDrawing(lobby: LobbyRow, nextRound: number): Promise<LobbyRow> {
-  const { prompt, usedPrompts } = chooseNext(lobby);
-  const rows = await db
-    .update(lobbies)
-    .set({
-      status: "drawing",
-      round: nextRound,
-      prompt,
-      usedPrompts,
-      phaseEndsAt: new Date(Date.now() + lobby.drawSeconds * 1000),
-      rev: lobby.rev + 1,
-      updatedAt: new Date(),
-    })
-    .where(eq(lobbies.id, lobby.id))
-    .returning();
-  return rows[0] ?? lobby;
+function hex(n: number): string {
+  const bytes = new Uint8Array(n);
+  if (typeof crypto !== "undefined" && "getRandomValues" in crypto) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < n; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-function chooseNext(lobby: LobbyRow): { prompt: string; usedPrompts: string[] } {
+const makePlayerId = () => `p${hex(10)}`;
+const drawingIdFor = (round: number, pid: string) => `d-r${round}-${pid}`;
+const voteIdFor = (round: number, pid: string) => `v-r${round}-${pid}`;
+
+function packPrompts(packId: string): string[] {
+  const pack = PROMPT_PACKS.find((p) => p.id === packId) ?? PROMPT_PACKS[0];
+  return pack.prompts;
+}
+
+function chooseNext(lobby: LobbyDoc): { prompt: string; usedPrompts: string[] } {
   const customs = (lobby.customPrompts ?? []).map((c) => c.trim()).filter(Boolean);
   const poolSource = customs.length > 0 ? customs : packPrompts(lobby.promptPack);
   const used = lobby.usedPrompts ?? [];
@@ -186,111 +170,153 @@ function chooseNext(lobby: LobbyRow): { prompt: string; usedPrompts: string[] } 
   return { prompt, usedPrompts: nextUsed.slice(-150) };
 }
 
-function packPrompts(packId: string): string[] {
-  const pack = PROMPT_PACKS.find((p) => p.id === packId) ?? PROMPT_PACKS[0];
-  return pack.prompts;
+async function bump(code: string, rev: number): Promise<void> {
+  await updateDoc(lobbyRef(code), { rev: rev + 1, updatedAt: now() });
 }
 
-export async function createLobby(input: {
-  name: string;
-  drawSeconds?: number;
-  voteSeconds?: number;
-  promptPack?: string;
-  customPrompts?: string[];
-}): Promise<{ lobby: LobbyRow; player: PlayerRow }> {
-  const name = sanitizeName(input.name);
-  const packs = packIds();
-  const pack = packs.includes(input.promptPack ?? "") ? (input.promptPack as string) : "mixed";
+/* --------------------------------------------------------- phase machine */
 
-  let lobby: LobbyRow | null = null;
-  for (let attempt = 0; attempt < 8 && !lobby; attempt++) {
-    const code = makeCode();
-    try {
-      const rows = await db
-        .insert(lobbies)
-        .values({
-          code,
-          drawSeconds: clamp(Math.round(input.drawSeconds ?? 90), 20, 300),
-          voteSeconds: clamp(Math.round(input.voteSeconds ?? 30), 10, 120),
-          promptPack: pack,
-          customPrompts: (input.customPrompts ?? []).slice(0, 30).map((c) => c.slice(0, 60)),
-        })
-        .returning();
-      lobby = rows[0] ?? null;
-    } catch {
-      lobby = null;
+/**
+ * Flips a phase using a guarded transaction (only the lobby doc inside the tx),
+ * then applies the side effects — so double-runs never double-count anything.
+ */
+async function flipPhase(
+  code: string,
+  from: LobbyStatus,
+  patch: (l: LobbyDoc) => Record<string, unknown>,
+): Promise<boolean> {
+  let flipped = false;
+  try {
+    await runTransaction(getFbs(), async (tx) => {
+      const snap = await tx.get(lobbyRef(code));
+      const l = snap.data() as LobbyDoc | undefined;
+      if (!l || l.status !== from) return;
+      tx.update(lobbyRef(code), { ...patch(l), rev: l.rev + 1, updatedAt: now() });
+      flipped = true;
+    });
+  } catch {
+    return false;
+  }
+  return flipped;
+}
+
+async function beginVoting(code: string): Promise<void> {
+  const l = await getLobby(code);
+  if (!l || l.status !== "drawing") return;
+  const entries = await readRoundDrawings(code, l.round);
+  const flipped = await flipPhase(code, "drawing", (cur) =>
+    entries.length === 0
+      ? { status: "lobby" as LobbyStatus, phaseEndsAt: null, prompt: null }
+      : { status: "voting" as LobbyStatus, phaseEndsAt: now() + cur.voteSeconds * 1000 },
+  );
+  if (!flipped || entries.length === 0) return;
+
+  const batch = writeBatch(getFbs());
+  shuffle(entries.map((e) => e.id)).forEach((id, i) => batch.update(drawingRef(code, id), { displayOrder: i }));
+  await batch.commit();
+}
+
+async function beginResults(code: string): Promise<void> {
+  const l = await getLobby(code);
+  if (!l || l.status !== "voting") return;
+  const entries = await readRoundDrawings(code, l.round);
+  const ballots = await readRoundVotes(code, l.round);
+
+  const tally: Record<string, number> = {};
+  for (const v of ballots) tally[v.drawingId] = (tally[v.drawingId] ?? 0) + 1;
+  const top = entries.length > 0 ? Math.max(0, ...entries.map((e) => tally[e.id] ?? 0)) : 0;
+  const winners = top > 0 ? entries.filter((e) => (tally[e.id] ?? 0) === top) : [];
+  const awarded: Record<string, number> = {};
+  for (const e of entries) {
+    const points = (tally[e.id] ?? 0) + (winners.some((w) => w.id === e.id) ? WINNER_BONUS : 0);
+    if (points > 0) awarded[e.playerId] = (awarded[e.playerId] ?? 0) + points;
+  }
+
+  const flipped = await flipPhase(code, "voting", () => ({
+    status: "results" as LobbyStatus,
+    phaseEndsAt: null,
+  }));
+  if (!flipped) return;
+
+  if (Object.keys(awarded).length > 0) {
+    const batch = writeBatch(getFbs());
+    for (const [pid, points] of Object.entries(awarded)) {
+      batch.update(playerRef(code, pid), { score: increment(points) });
     }
+    await batch.commit();
   }
-  if (!lobby) throw new Error("Could not open a lobby right now, try again.");
-
-  const playerRows = await db
-    .insert(players)
-    .values({ lobbyId: lobby.id, token: makeToken(), name, isHost: true, colorIdx: 0 })
-    .returning();
-  const player = playerRows[0];
-  if (!player) throw new Error("Could not seat you at the table.");
-
-  return { lobby, player };
 }
 
-export async function joinLobby(
-  lobby: LobbyRow,
-  name: string,
-  existing?: PlayerRow | null,
-): Promise<PlayerRow> {
-  if (existing) return existing;
-  const clean = sanitizeName(name);
-  const roster = await db.select().from(players).where(eq(players.lobbyId, lobby.id));
-  let finalName = clean;
-  let suffix = 2;
-  while (roster.some((p) => p.name.toLowerCase() === finalName.toLowerCase())) {
-    finalName = `${clean.slice(0, 14)} ${suffix}`;
-    suffix += 1;
-  }
-  const colorIdx = roster.length % 12;
-  const rows = await db
-    .insert(players)
-    .values({ lobbyId: lobby.id, token: makeToken(), name: finalName, colorIdx })
-    .returning();
-  const player = rows[0];
-  if (!player) throw new Error("Could not join that lobby.");
-  await bump(lobby.id);
-  return player;
+async function beginDrawing(code: string, nextRound: number, from: "start" | "next"): Promise<void> {
+  const lobby = lobbyRef(code);
+  await runTransaction(getFbs(), async (tx) => {
+    const snap = await tx.get(lobby);
+    const l = snap.data() as LobbyDoc | undefined;
+    if (!l) throw new Error("This lobby just closed.");
+    if (from === "start" && l.status !== "lobby" && l.status !== "results")
+      throw new Error("A round is already running.");
+    if (from === "next" && l.status !== "results") throw new Error("This round is still running.");
+
+    const { prompt, usedPrompts } = chooseNext(l);
+    tx.update(lobby, {
+      status: "drawing" as LobbyStatus,
+      round: nextRound,
+      prompt,
+      usedPrompts,
+      phaseEndsAt: now() + l.drawSeconds * 1000,
+      rev: l.rev + 1,
+      updatedAt: now(),
+    });
+  });
 }
 
-export async function buildState(lobby: LobbyRow, me: PlayerRow | null): Promise<LobbyState> {
-  const roster = await db
-    .select()
-    .from(players)
-    .where(eq(players.lobbyId, lobby.id))
-    .orderBy(asc(players.id));
-  const now = Date.now();
+/** Runs on every poll/action so timers never need a background worker. */
+export async function advancePhase(code: string): Promise<LobbyDoc | null> {
+  for (let i = 0; i < 4; i++) {
+    const current = await getLobby(code);
+    if (!current) return null;
+    if (!current.phaseEndsAt || current.phaseEndsAt > now()) return current;
+    if (current.status === "drawing") await beginVoting(code);
+    else if (current.status === "voting") await beginResults(code);
+    else return current;
+  }
+  return getLobby(code);
+}
 
-  let entries: DrawingRow[] = [];
-  let ballots: VoteRow[] = [];
+/* ------------------------------------------------------------------ state */
+
+export async function buildState(code: string, me: PlayerDoc | null): Promise<LobbyState> {
+  const lobby = (await getLobby(code)) as LobbyDoc;
+  const roster = await readPlayers(code);
+  const ts = now();
+
+  let entries: DrawingDoc[] = [];
+  let ballots: VoteDoc[] = [];
   if (lobby.status !== "lobby") {
-    entries = await roundDrawings(lobby.id, lobby.round);
-    if (lobby.status !== "drawing") ballots = await roundVotes(lobby.id, lobby.round);
+    entries = await readRoundDrawings(code, lobby.round);
+    if (lobby.status !== "drawing") ballots = await readRoundVotes(code, lobby.round);
   }
 
   const submitted = new Set(entries.map((d) => d.playerId));
   const voted = new Set(ballots.map((v) => v.voterId));
   const reveal = lobby.status === "results";
 
-  const tally = new Map<number, number>();
-  for (const v of ballots) tally.set(v.drawingId, (tally.get(v.drawingId) ?? 0) + 1);
-  const top = entries.length > 0 ? Math.max(0, ...entries.map((d) => tally.get(d.id) ?? 0)) : 0;
+  const tally: Record<string, number> = {};
+  for (const v of ballots) tally[v.drawingId] = (tally[v.drawingId] ?? 0) + 1;
+  const top = entries.length > 0 ? Math.max(0, ...entries.map((d) => tally[d.id] ?? 0)) : 0;
 
-  const nameOf = (id: number) => roster.find((p) => p.id === id)?.name ?? "Someone";
+  const nameOf = (id: string) => roster.find((p) => p.id === id)?.name ?? "Someone";
+  const colorOf = (id: string) => roster.find((p) => p.id === id)?.colorIdx ?? 0;
 
-  const drawingStates: DrawingState[] = entries.map((d) => {
+  const ordered = [...entries].sort((a, b) => a.displayOrder - b.displayOrder || a.id.localeCompare(b.id));
+  const drawingStates: DrawingState[] = ordered.map((d) => {
     const mine = me?.id === d.playerId;
     const forThis = ballots.filter((v) => v.drawingId === d.id);
     return {
       id: d.id,
       playerId: d.playerId,
       authorName: reveal || mine ? nameOf(d.playerId) : "",
-      authorColor: roster.find((p) => p.id === d.playerId)?.colorIdx ?? 0,
+      authorColor: colorOf(d.playerId),
       strokes: (reveal || lobby.status === "voting" || mine ? d.strokes : []) as Stroke[],
       isYours: mine,
       displayOrder: d.displayOrder,
@@ -306,7 +332,7 @@ export async function buildState(lobby: LobbyRow, me: PlayerRow | null): Promise
     isHost: p.isHost,
     score: p.score,
     color: p.colorIdx,
-    online: now - p.lastSeenAt.getTime() < ONLINE_WINDOW_MS,
+    online: ts - p.lastSeenAt < ONLINE_WINDOW_MS,
     submitted: submitted.has(p.id),
     voted: voted.has(p.id),
     isYou: me?.id === p.id,
@@ -314,10 +340,7 @@ export async function buildState(lobby: LobbyRow, me: PlayerRow | null): Promise
 
   const myDrawing = entries.find((d) => d.playerId === me?.id) ?? null;
   const myVote = ballots.find((v) => v.voterId === me?.id) ?? null;
-  const winners =
-    reveal && top > 0
-      ? entries.filter((d) => (tally.get(d.id) ?? 0) === top).map((d) => d.playerId)
-      : [];
+  const winners = reveal && top > 0 ? entries.filter((d) => (tally[d.id] ?? 0) === top).map((d) => d.playerId) : [];
 
   return {
     code: lobby.code,
@@ -325,14 +348,14 @@ export async function buildState(lobby: LobbyRow, me: PlayerRow | null): Promise
     round: lobby.round,
     rev: lobby.rev,
     prompt: lobby.status === "lobby" ? null : lobby.prompt,
-    phaseEndsAt: lobby.phaseEndsAt ? lobby.phaseEndsAt.getTime() : null,
-    serverNow: now,
+    phaseEndsAt: lobby.phaseEndsAt,
+    serverNow: ts,
     settings: {
       drawSeconds: lobby.drawSeconds,
       voteSeconds: lobby.voteSeconds,
       promptPack: lobby.promptPack,
       customPrompts: lobby.customPrompts ?? [],
-    },
+    } satisfies LobbySettings,
     you: me ? { id: me.id, name: me.name, isHost: me.isHost, color: me.colorIdx } : null,
     players: playerStates,
     drawings: drawingStates,
@@ -343,205 +366,282 @@ export async function buildState(lobby: LobbyRow, me: PlayerRow | null): Promise
     winnerBonus: WINNER_BONUS,
     totals: roster
       .map((p) => ({ playerId: p.id, name: p.name, score: p.score, color: p.colorIdx }))
-      .sort((a, b) => b.score - a.score || a.playerId - b.playerId),
+      .sort((a, b) => b.score - a.score || a.playerId.localeCompare(b.playerId)),
     roundWinners: winners,
     playerCount: roster.length,
   };
 }
 
-export type ActionResult = { ok: true; state: LobbyState } | { ok: false; error: string };
+/* ----------------------------------------------------------------- create */
 
-function fail(error: string): ActionResult {
-  return { ok: false, error };
+export async function createLobby(input: {
+  name: string;
+  drawSeconds?: number;
+  voteSeconds?: number;
+  promptPack?: string;
+  customPrompts?: string[];
+}): Promise<{ code: string; player: PlayerDoc }> {
+  const name = sanitizeName(input.name);
+  const packs = packIds();
+  const pack = packs.includes(input.promptPack ?? "") ? (input.promptPack as string) : "mixed";
+  const ts = now();
+
+  let code = "";
+  for (let attempt = 0; attempt < 8 && !code; attempt++) {
+    const candidate = makeCode();
+    const exists = await getDoc(lobbyRef(candidate));
+    if (!exists.exists()) code = candidate;
+  }
+  if (!code) throw new Error("Could not open a lobby right now, try again.");
+
+  const player: Omit<PlayerDoc, "id"> & { id: string } = {
+    id: makePlayerId(),
+    token: makeToken(),
+    name,
+    isHost: true,
+    score: 0,
+    colorIdx: 0,
+    lastSeenAt: ts,
+    createdAt: ts,
+  };
+
+  const batch = writeBatch(getFbs());
+  batch.set(lobbyRef(code), {
+    code,
+    status: "lobby" as LobbyStatus,
+    round: 0,
+    prompt: null,
+    phaseEndsAt: null,
+    drawSeconds: clamp(Math.round(input.drawSeconds ?? 90), 20, 300),
+    voteSeconds: clamp(Math.round(input.voteSeconds ?? 30), 10, 120),
+    promptPack: pack,
+    customPrompts: (input.customPrompts ?? []).slice(0, 30).map((c) => sanitizeName(c).slice(0, 60)),
+    usedPrompts: [],
+    rev: 1,
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  batch.set(playerRef(code, player.id), player);
+  await batch.commit();
+
+  return { code, player };
 }
 
+export async function joinLobby(code: string, name: string, existing?: PlayerDoc | null): Promise<PlayerDoc> {
+  if (existing) return existing;
+  const clean = sanitizeName(name);
+  const roster = await readPlayers(code);
+  let finalName = clean;
+  let suffix = 2;
+  while (roster.some((p) => p.name.toLowerCase() === finalName.toLowerCase())) {
+    finalName = `${clean.slice(0, 14)} ${suffix}`;
+    suffix += 1;
+  }
+  const ts = now();
+  const player: PlayerDoc = {
+    id: makePlayerId(),
+    token: makeToken(),
+    name: finalName,
+    isHost: false,
+    score: 0,
+    colorIdx: roster.length % 12,
+    lastSeenAt: ts,
+    createdAt: ts,
+  };
+  await setDoc(playerRef(code, player.id), player);
+  const lobby = (await getLobby(code)) as LobbyDoc;
+  await bump(code, lobby.rev);
+  return player;
+}
+
+/* ----------------------------------------------------------------- actions */
+
+export type ActionResult = { ok: true; state: LobbyState } | { ok: false; error: string };
+
+const fail = (error: string): ActionResult => ({ ok: false, error });
+
 export async function handleAction(
-  lobbyIn: LobbyRow,
-  me: PlayerRow | null,
+  codeIn: string,
+  me: PlayerDoc | null,
   type: string,
   payload: Record<string, unknown>,
 ): Promise<ActionResult> {
-  const lobby = await advancePhase(lobbyIn);
-
+  const code = codeIn;
+  const lobby = await advancePhase(code);
+  if (!lobby) return fail("This lobby just closed.");
   if (!me) return fail("Join the lobby first.");
 
-  const num = (v: unknown, fallback: number) =>
-    Number.isFinite(Number(v)) && v !== null && v !== undefined && v !== "" ? Number(v) : fallback;
+  const str = (v: unknown) => (typeof v === "string" && v.length > 0 && v.length <= 160 ? v : "");
 
-  if (type === "ping") {
-    await touchPlayer(me.id);
-    return { ok: true, state: await buildState(lobby, me) };
-  }
-
-  if (type === "rename") {
-    const name = sanitizeName(String(payload.name ?? ""));
-    await db.update(players).set({ name }).where(eq(players.id, me.id));
-    await bump(lobby.id);
-    const fresh = await reloadLobby(lobby.id);
-    const freshMe = await authenticate(lobby.id, me.id, me.token);
-    return { ok: true, state: await buildState(fresh ?? lobby, freshMe) };
-  }
-
-  if (type === "leave") {
-    await db.delete(players).where(eq(players.id, me.id));
-    const remaining = await db
-      .select()
-      .from(players)
-      .where(eq(players.lobbyId, lobby.id))
-      .orderBy(asc(players.id));
-    if (remaining.length === 0) {
-      await db.delete(lobbies).where(eq(lobbies.id, lobby.id));
-    } else if (me.isHost) {
-      await db
-        .update(players)
-        .set({ isHost: true })
-        .where(eq(players.id, remaining[0].id));
-      await bump(lobby.id);
-    } else {
-      await bump(lobby.id);
+  switch (type) {
+    case "ping": {
+      await touchPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, me) };
     }
-    return fail("You left the lobby.");
-  }
 
-  if (type === "kick") {
-    if (!me.isHost) return fail("Only the host can show someone the door.");
-    const targetId = num(payload.playerId, 0);
-    if (!targetId || targetId === me.id) return fail("Pick someone else to remove.");
-    await db.delete(players).where(and(eq(players.id, targetId), eq(players.lobbyId, lobby.id)));
-    await bump(lobby.id);
-    const fresh = await reloadLobby(lobby.id);
-    return { ok: true, state: await buildState(fresh ?? lobby, me) };
-  }
+    case "rename": {
+      const name = sanitizeName(String(payload.name ?? ""));
+      await updateDoc(playerRef(code, me.id), { name });
+      await bump(code, lobby.rev);
+      const freshMe = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, freshMe) };
+    }
 
-  if (type === "settings") {
-    if (!me.isHost) return fail("Only the host can tweak the rules.");
-    if (lobby.status === "drawing" || lobby.status === "voting")
-      return fail("Wait for this round to finish.");
-    const packs = packIds();
-    const packRaw = String(payload.promptPack ?? lobby.promptPack);
-    const customs = Array.isArray(payload.customPrompts)
-      ? (payload.customPrompts as unknown[])
-          .map((c) => sanitizeName(String(c ?? "")))
-          .filter((c) => c && c !== "Anonymous")
-          .slice(0, 30)
-      : lobby.customPrompts ?? [];
-    await db
-      .update(lobbies)
-      .set({
-        drawSeconds: clamp(Math.round(num(payload.drawSeconds, lobby.drawSeconds)), 20, 300),
-        voteSeconds: clamp(Math.round(num(payload.voteSeconds, lobby.voteSeconds)), 10, 120),
+    case "leave": {
+      const batch = writeBatch(getFbs());
+      batch.delete(playerRef(code, me.id));
+      const roster = (await readPlayers(code)).filter((p) => p.id !== me.id);
+      if (roster.length === 0) {
+        batch.delete(lobbyRef(code));
+        for (const d of await readRoundDrawings(code, lobby.round)) batch.delete(drawingRef(code, d.id));
+        for (const v of await readRoundVotes(code, lobby.round)) batch.delete(voteRef(code, v.id));
+      } else if (me.isHost) {
+        batch.update(playerRef(code, roster[0].id), { isHost: true });
+      }
+      await batch.commit();
+      if (roster.length > 0) await bump(code, lobby.rev);
+      return fail("You left the lobby.");
+    }
+
+    case "kick": {
+      if (!me.isHost) return fail("Only the host can show someone the door.");
+      const targetId = str(payload.playerId);
+      if (!targetId || targetId === me.id) return fail("Pick someone else to remove.");
+      const target = await readPlayer(code, targetId);
+      if (!target) return fail("That player is already gone.");
+      const batch = writeBatch(getFbs());
+      batch.delete(playerRef(code, targetId));
+      for (const d of await readRoundDrawings(code, lobby.round)) {
+        if (d.playerId === targetId) batch.delete(drawingRef(code, d.id));
+      }
+      for (const v of await readRoundVotes(code, lobby.round)) {
+        if (v.voterId === targetId) batch.delete(voteRef(code, v.id));
+      }
+      await batch.commit();
+      await bump(code, lobby.rev);
+      const freshMe = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, freshMe) };
+    }
+
+    case "settings": {
+      if (!me.isHost) return fail("Only the host can tweak the rules.");
+      if (lobby.status === "drawing" || lobby.status === "voting")
+        return fail("Wait for this round to finish.");
+      const packs = packIds();
+      const packRaw = str(payload.promptPack) || lobby.promptPack;
+      const customs = Array.isArray(payload.customPrompts)
+        ? (payload.customPrompts as unknown[])
+            .map((c) => sanitizeName(String(c ?? "")))
+            .filter((c) => c && c !== "Anonymous")
+            .slice(0, 30)
+        : lobby.customPrompts ?? [];
+      await updateDoc(lobbyRef(code), {
+        drawSeconds: clamp(Math.round(Number(payload.drawSeconds) || lobby.drawSeconds), 20, 300),
+        voteSeconds: clamp(Math.round(Number(payload.voteSeconds) || lobby.voteSeconds), 10, 120),
         promptPack: packs.includes(packRaw) ? packRaw : "mixed",
         customPrompts: customs,
         usedPrompts: [],
         rev: lobby.rev + 1,
-        updatedAt: new Date(),
-      })
-      .where(eq(lobbies.id, lobby.id));
-    const fresh = await reloadLobby(lobby.id);
-    return { ok: true, state: await buildState(fresh ?? lobby, me) };
-  }
+        updatedAt: now(),
+      });
+      const fresh = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, fresh) };
+    }
 
-  if (type === "start") {
-    if (!me.isHost) return fail("Only the host can start the round.");
-    if (lobby.status !== "lobby" && lobby.status !== "results")
-      return fail("A round is already running.");
-    const nextRound = lobby.status === "results" ? lobby.round + 1 : Math.max(1, lobby.round + 1);
-    const fresh = await beginDrawing(lobby, nextRound);
-    return { ok: true, state: await buildState(fresh, me) };
-  }
+    case "start": {
+      if (!me.isHost) return fail("Only the host can start the round.");
+      try {
+        await beginDrawing(code, lobby.round + 1, "start");
+      } catch (err) {
+        return fail(err instanceof Error ? err.message : "Could not start the round.");
+      }
+      return { ok: true, state: await buildState(code, me) };
+    }
 
-  if (type === "next") {
-    if (lobby.status !== "results") return fail("This round is still running.");
-    const fresh = await beginDrawing(lobby, lobby.round + 1);
-    return { ok: true, state: await buildState(fresh, me) };
-  }
+    case "next": {
+      try {
+        await beginDrawing(code, lobby.round + 1, "next");
+      } catch (err) {
+        return fail(err instanceof Error ? err.message : "Could not start the round.");
+      }
+      return { ok: true, state: await buildState(code, me) };
+    }
 
-  if (type === "submit") {
-    if (lobby.status !== "drawing") return fail("Pencils are down.");
-    const { strokes, ok } = sanitizeStrokes(payload.strokes);
-    if (!ok) return fail("Draw something first — an empty canvas cannot win votes.");
-    await db
-      .insert(drawings)
-      .values({
-        lobbyId: lobby.id,
+    case "submit": {
+      if (lobby.status !== "drawing") return fail("Pencils are down.");
+      const { strokes, ok } = sanitizeStrokes(payload.strokes);
+      if (!ok) return fail("Draw something first — an empty canvas cannot win votes.");
+      const did = drawingIdFor(lobby.round, me.id);
+      await setDoc(drawingRef(code, did), {
         playerId: me.id,
         round: lobby.round,
         prompt: lobby.prompt ?? "",
         strokes,
-      })
-      .onConflictDoUpdate({
-        target: [drawings.lobbyId, drawings.round, drawings.playerId],
-        set: { strokes, submittedAt: new Date() },
+        displayOrder: 0,
+        submittedAt: now(),
       });
-    await bump(lobby.id);
+      await bump(code, lobby.rev);
 
-    const entries = await roundDrawings(lobby.id, lobby.round);
-    const rosterSize = await db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(players)
-      .where(eq(players.lobbyId, lobby.id));
-    const total = rosterSize[0]?.n ?? 0;
-    let fresh = await reloadLobby(lobby.id);
-    if (fresh && fresh.status === "drawing" && entries.length >= total && entries.length > 0) {
-      fresh = await beginVoting(fresh);
+      const entries = await readRoundDrawings(code, lobby.round);
+      const rosterSize = (await readPlayers(code)).length;
+      if (entries.length >= rosterSize && entries.length > 0) await beginVoting(code);
+      const fresh = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, fresh) };
     }
-    return { ok: true, state: await buildState(fresh ?? lobby, me) };
-  }
 
-  if (type === "vote") {
-    if (lobby.status !== "voting") return fail("Voting is not open right now.");
-    const drawingId = num(payload.drawingId, 0);
-    const entries = await roundDrawings(lobby.id, lobby.round);
-    const target = entries.find((d) => d.id === drawingId);
-    if (!target) return fail("That drawing is not in this round.");
-    if (target.playerId === me.id)
-      return fail("Nice try — you cannot vote for your own drawing.");
+    case "vote": {
+      if (lobby.status !== "voting") return fail("Voting is not open right now.");
+      const drawingId = str(payload.drawingId);
+      const entries = await readRoundDrawings(code, lobby.round);
+      const target = entries.find((d) => d.id === drawingId);
+      if (!target) return fail("That drawing is not in this round.");
+      if (target.playerId === me.id)
+        return fail("Nice try — you cannot vote for your own drawing.");
 
-    const existing = await db
-      .select()
-      .from(votes)
-      .where(and(eq(votes.voterId, me.id), eq(votes.lobbyId, lobby.id), eq(votes.round, lobby.round)))
-      .limit(1);
-    const current = existing[0];
-
-    if (current && current.drawingId === drawingId) {
-      await db.delete(votes).where(eq(votes.id, current.id));
-    } else if (current) {
-      await db.update(votes).set({ drawingId }).where(eq(votes.id, current.id));
-    } else {
-      await db.insert(votes).values({
-        lobbyId: lobby.id,
-        drawingId,
-        voterId: me.id,
-        round: lobby.round,
-      });
+      const vid = voteIdFor(lobby.round, me.id);
+      const existing = await getDoc(voteRef(code, vid));
+      if (existing.exists()) {
+        const current = existing.data() as VoteDoc;
+        if (current.drawingId === drawingId) {
+          await deleteDoc(voteRef(code, vid));
+        } else {
+          await updateDoc(voteRef(code, vid), { drawingId, createdAt: now() });
+        }
+      } else {
+        await setDoc(voteRef(code, vid), {
+          drawingId,
+          voterId: me.id,
+          round: lobby.round,
+          createdAt: now(),
+        });
+      }
+      const freshLobby = await getLobby(code);
+      await bump(code, freshLobby?.rev ?? lobby.rev);
+      const fresh = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, fresh) };
     }
-    await bump(lobby.id);
 
-    const fresh = await reloadLobby(lobby.id);
-    return { ok: true, state: await buildState(fresh ?? lobby, me) };
-  }
-
-  if (type === "reset") {
-    if (!me.isHost) return fail("Only the host can wipe the scoreboard.");
-    await db.delete(votes).where(eq(votes.lobbyId, lobby.id));
-    await db.delete(drawings).where(eq(drawings.lobbyId, lobby.id));
-    await db.update(players).set({ score: 0 }).where(eq(players.lobbyId, lobby.id));
-    await db
-      .update(lobbies)
-      .set({
-        status: "lobby",
+    case "reset": {
+      if (!me.isHost) return fail("Only the host can wipe the scoreboard.");
+      const batch = writeBatch(getFbs());
+      for (const v of await readRoundVotes(code, lobby.round)) batch.delete(voteRef(code, v.id));
+      for (const d of await readRoundDrawings(code, lobby.round)) batch.delete(drawingRef(code, d.id));
+      for (const p of await readPlayers(code)) batch.update(playerRef(code, p.id), { score: 0 });
+      batch.update(lobbyRef(code), {
+        status: "lobby" as LobbyStatus,
         round: 0,
         prompt: null,
         phaseEndsAt: null,
         usedPrompts: [],
         rev: lobby.rev + 1,
-        updatedAt: new Date(),
-      })
-      .where(eq(lobbies.id, lobby.id));
-    const fresh = await reloadLobby(lobby.id);
-    return { ok: true, state: await buildState(fresh ?? lobby, me) };
-  }
+        updatedAt: now(),
+      });
+      await batch.commit();
+      const fresh = await readPlayer(code, me.id);
+      return { ok: true, state: await buildState(code, fresh) };
+    }
 
-  return fail(`Unknown action: ${type}`);
+    default:
+      return fail(`Unknown action: ${type}`);
+  }
 }
